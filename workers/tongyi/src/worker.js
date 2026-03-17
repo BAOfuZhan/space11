@@ -2,7 +2,7 @@
 // 多学校抢座管理中枢 — Cloudflare Worker
 // ====================================================================
 // 功能:
-//   1. scheduled()  在预约窗口内轮询学校，并异步写入秒级心跳到 KV
+//   1. scheduled()  在预约窗口内轮询学校，并在每次 Cron 触发时立即写入心跳到 KV
 //   2. fetch()      REST API + 内嵌 Web 管理面板
 //
 // KV Schema (binding: SEAT_KV):
@@ -71,6 +71,16 @@ function beijingDateHour() {
   return `${y}-${m}-${day}-${hour}`;
 }
 
+function beijingDateMinute(timestampMs = Date.now()) {
+  const d = new Date(timestampMs + 8 * 3600 * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hour = String(d.getUTCHours()).padStart(2, "0");
+  const minute = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${y}-${m}-${day}-${hour}:${minute}`;
+}
+
 function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -83,9 +93,14 @@ function jsonResp(data, status = 200) {
 }
 
 const HEARTBEAT_LAST_TS_KEY = "meta:heartbeat:last_ts";
-const HEARTBEAT_TARGET_SECOND = 50;
+const HEARTBEAT_LAST_MINUTE_KEY = "meta:heartbeat:last_minute";
 const FALLBACK_TRIGGER_PREFIX = "meta:fallback_trigger";
 const FALLBACK_TRIGGER_TTL_SECONDS = 14 * 24 * 60 * 60;
+const SCHOOLS_SNAPSHOT_KEY = "meta:schools:full";
+
+function schoolUsersSnapshotKey(schoolId) {
+  return `school:${schoolId}:users:full`;
+}
 
 // ─── KV 操作 ───
 
@@ -98,13 +113,67 @@ async function saveSchools(KV, schools) {
   await KV.put("schools", JSON.stringify(schools));
 }
 
+async function getSchoolsSnapshot(KV) {
+  const raw = await KV.get(SCHOOLS_SNAPSHOT_KEY);
+  if (raw) return JSON.parse(raw);
+
+  const schoolIds = await getSchools(KV);
+  if (schoolIds.length === 0) return [];
+
+  const schools = [];
+  for (const schoolId of schoolIds) {
+    const school = await getSchool(KV, schoolId);
+    if (!school) continue;
+    const userIds = await getSchoolUsers(KV, schoolId);
+    schools.push({ ...school, userCount: userIds.length });
+  }
+  await saveSchoolsSnapshot(KV, schools);
+  return schools;
+}
+
+async function saveSchoolsSnapshot(KV, schools) {
+  await KV.put(SCHOOLS_SNAPSHOT_KEY, JSON.stringify(schools));
+}
+
+async function upsertSchoolInSnapshot(KV, school, userCount = null) {
+  const schools = await getSchoolsSnapshot(KV);
+  const existing = schools.find(item => item && item.id === school.id);
+  const nextSchool = {
+    ...(existing || {}),
+    ...school,
+    userCount: userCount ?? existing?.userCount ?? 0,
+  };
+  const nextSchools = schools.filter(item => item && item.id !== school.id);
+  nextSchools.push(nextSchool);
+  await saveSchoolsSnapshot(KV, nextSchools);
+}
+
+async function removeSchoolFromSnapshot(KV, schoolId) {
+  const schools = await getSchoolsSnapshot(KV);
+  await saveSchoolsSnapshot(
+    KV,
+    schools.filter(item => item && item.id !== schoolId)
+  );
+}
+
+async function setSchoolUserCountInSnapshot(KV, schoolId, userCount) {
+  const schools = await getSchoolsSnapshot(KV);
+  const nextSchools = schools.map(item => (
+    item && item.id === schoolId ? { ...item, userCount } : item
+  ));
+  await saveSchoolsSnapshot(KV, nextSchools);
+}
+
 async function getSchool(KV, schoolId) {
   const raw = await KV.get(`school:${schoolId}`);
   return raw ? JSON.parse(raw) : null;
 }
 
 async function saveSchool(KV, school) {
-  await KV.put(`school:${school.id}`, JSON.stringify(school));
+  await Promise.all([
+    KV.put(`school:${school.id}`, JSON.stringify(school)),
+    upsertSchoolInSnapshot(KV, school),
+  ]);
 }
 
 async function deleteSchool(KV, schoolId) {
@@ -116,9 +185,13 @@ async function deleteSchool(KV, schoolId) {
     await KV.delete(`school:${schoolId}:user:${uid}`);
   }
   await KV.delete(`school:${schoolId}:users`);
+  await KV.delete(schoolUsersSnapshotKey(schoolId));
   // 从学校列表移除
   const schools = await getSchools(KV);
-  await saveSchools(KV, schools.filter(id => id !== schoolId));
+  await Promise.all([
+    saveSchools(KV, schools.filter(id => id !== schoolId)),
+    removeSchoolFromSnapshot(KV, schoolId),
+  ]);
 }
 
 async function getSchoolUsers(KV, schoolId) {
@@ -130,19 +203,61 @@ async function saveSchoolUsers(KV, schoolId, userIds) {
   await KV.put(`school:${schoolId}:users`, JSON.stringify(userIds));
 }
 
+async function getSchoolUsersSnapshot(KV, schoolId) {
+  const raw = await KV.get(schoolUsersSnapshotKey(schoolId));
+  if (raw) return JSON.parse(raw);
+
+  const userIds = await getSchoolUsers(KV, schoolId);
+  if (userIds.length === 0) return [];
+
+  const users = [];
+  for (const userId of userIds) {
+    const user = await getUser(KV, schoolId, userId);
+    if (user) users.push(user);
+  }
+  await saveSchoolUsersSnapshot(KV, schoolId, users);
+  return users;
+}
+
+async function saveSchoolUsersSnapshot(KV, schoolId, users) {
+  await KV.put(schoolUsersSnapshotKey(schoolId), JSON.stringify(users));
+}
+
+async function upsertUserInSnapshot(KV, schoolId, user) {
+  const users = await getSchoolUsersSnapshot(KV, schoolId);
+  const nextUsers = users.filter(item => item && item.id !== user.id);
+  nextUsers.push(user);
+  await saveSchoolUsersSnapshot(KV, schoolId, nextUsers);
+}
+
+async function removeUserFromSnapshot(KV, schoolId, userId) {
+  const users = await getSchoolUsersSnapshot(KV, schoolId);
+  await saveSchoolUsersSnapshot(
+    KV,
+    schoolId,
+    users.filter(item => item && item.id !== userId)
+  );
+}
+
 async function getUser(KV, schoolId, userId) {
   const raw = await KV.get(`school:${schoolId}:user:${userId}`);
   return raw ? JSON.parse(raw) : null;
 }
 
 async function saveUser(KV, schoolId, user) {
-  await KV.put(`school:${schoolId}:user:${user.id}`, JSON.stringify(user));
+  await Promise.all([
+    KV.put(`school:${schoolId}:user:${user.id}`, JSON.stringify(user)),
+    upsertUserInSnapshot(KV, schoolId, user),
+  ]);
 }
 
 async function deleteUser(KV, schoolId, userId) {
-  await KV.delete(`school:${schoolId}:user:${userId}`);
   const userIds = await getSchoolUsers(KV, schoolId);
-  await saveSchoolUsers(KV, schoolId, userIds.filter(id => id !== userId));
+  await Promise.all([
+    KV.delete(`school:${schoolId}:user:${userId}`),
+    saveSchoolUsers(KV, schoolId, userIds.filter(id => id !== userId)),
+    removeUserFromSnapshot(KV, schoolId, userId),
+  ]);
 }
 
 function minuteBucket(timestampMs) {
@@ -156,44 +271,29 @@ async function getHeartbeatTimestamp(KV) {
   return ts;
 }
 
+async function getHeartbeatMinuteSlot(KV) {
+  const raw = await KV.get(HEARTBEAT_LAST_MINUTE_KEY);
+  const slot = String(raw || "").trim();
+  return slot || null;
+}
+
 async function sleep(ms) {
   if (ms <= 0) return;
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function writeHeartbeatTimestamp(KV, timestampMs = Date.now()) {
-  const existingTs = await getHeartbeatTimestamp(KV);
-  if (
-    existingTs !== null &&
-    minuteBucket(existingTs) === minuteBucket(timestampMs)
-  ) {
-    return {
-      written: false,
-      reason: "already_written_this_minute",
-      timestamp: existingTs,
-      minuteBucket: minuteBucket(existingTs),
-    };
-  }
-
-  await KV.put(HEARTBEAT_LAST_TS_KEY, String(timestampMs));
+  const currentMinuteSlot = beijingDateMinute(timestampMs);
+  await Promise.all([
+    KV.put(HEARTBEAT_LAST_TS_KEY, String(timestampMs)),
+    KV.put(HEARTBEAT_LAST_MINUTE_KEY, currentMinuteSlot),
+  ]);
   return {
     written: true,
     timestamp: timestampMs,
+    minuteSlot: currentMinuteSlot,
     minuteBucket: minuteBucket(timestampMs),
   };
-}
-
-async function writeHeartbeatAtTargetSecond(KV, targetSecond = HEARTBEAT_TARGET_SECOND) {
-  const now = new Date();
-  const currentSecond = now.getUTCSeconds();
-  const currentMs = now.getUTCMilliseconds();
-
-  if (currentSecond < targetSecond) {
-    const delayMs = (targetSecond - currentSecond) * 1000 - currentMs;
-    await sleep(delayMs);
-  }
-
-  return writeHeartbeatTimestamp(KV, Date.now());
 }
 
 function buildFallbackTriggerKey(date, schoolId) {
@@ -474,11 +574,10 @@ function chunkArray(arr, size) {
   return chunks;
 }
 
-async function buildTodayDispatchUsers(KV, schoolId, school, today) {
-  const userIds = await getSchoolUsers(KV, schoolId);
+async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers = null) {
+  const sourceUsers = Array.isArray(schoolUsers) ? schoolUsers : await getSchoolUsersSnapshot(KV, schoolId);
   const users = [];
-  for (const userId of userIds) {
-    const user = await getUser(KV, schoolId, userId);
+  for (const user of sourceUsers) {
     if (!user || user.status !== "active") continue;
 
     const daySchedule = user.schedule[today];
@@ -643,17 +742,17 @@ function dayNameZh(day) {
   return map[day] || day;
 }
 
-async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "") {
+async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "", schoolUsers = null) {
   const incomingEntries = collectScheduleSeatEntries(schedule);
   if (incomingEntries.length === 0) return [];
 
-  const userIds = await getSchoolUsers(KV, schoolId);
+  const sourceUsers = Array.isArray(schoolUsers) ? schoolUsers : await getSchoolUsersSnapshot(KV, schoolId);
   const existingByKey = new Map();
 
-  for (const uid of userIds) {
+  for (const existingUser of sourceUsers) {
+    const uid = existingUser && existingUser.id;
+    if (!uid) continue;
     if (excludeUserId && uid === excludeUserId) continue;
-
-    const existingUser = await getUser(KV, schoolId, uid);
     if (!existingUser) continue;
 
     const owner = existingUser.username || "(无昵称)";
@@ -707,13 +806,12 @@ function buildSeatConflictError(conflicts) {
 async function handleScheduled(env) {
   const now = beijingHHMM();
   const today = beijingDayOfWeek();
-  const schoolIds = await getSchools(env.SEAT_KV);
+  const schools = await getSchoolsSnapshot(env.SEAT_KV);
 
-  for (const schoolId of schoolIds) {
-    const school = await getSchool(env.SEAT_KV, schoolId);
+  for (const school of schools) {
     if (!school || school.trigger_time !== now) continue;
 
-    const users = await buildTodayDispatchUsers(env.SEAT_KV, schoolId, school, today);
+    const users = await buildTodayDispatchUsers(env.SEAT_KV, school.id, school, today);
     if (users.length === 0) continue;
     const result = await dispatchUsersInBatches(env, school, users);
     console.log(
@@ -730,8 +828,9 @@ async function handleAPI(request, env, path) {
 
   // GET /api/status
   if (method === "GET" && path === "/api/status") {
-    const schoolIds = await getSchools(KV);
+    const schools = await getSchoolsSnapshot(KV);
     const lastHeartbeatTs = await getHeartbeatTimestamp(KV);
+    const lastHeartbeatMinuteSlot = await getHeartbeatMinuteSlot(KV);
     const heartbeatAgeMs = lastHeartbeatTs === null ? null : Math.max(0, Date.now() - lastHeartbeatTs);
     return jsonResp({
       ok: true,
@@ -741,10 +840,12 @@ async function handleAPI(request, env, path) {
       beijing_time: beijingHHMM(),
       beijing_date_hour: beijingDateHour(),
       day_of_week: beijingDayOfWeek(),
-      schoolCount: schoolIds.length,
+      schoolCount: schools.length,
       heartbeat: {
         key: HEARTBEAT_LAST_TS_KEY,
+        minuteKey: HEARTBEAT_LAST_MINUTE_KEY,
         lastTs: lastHeartbeatTs,
+        lastMinuteSlot: lastHeartbeatMinuteSlot,
         ageMs: heartbeatAgeMs,
       },
     });
@@ -752,15 +853,7 @@ async function handleAPI(request, env, path) {
 
   // GET /api/schools
   if (method === "GET" && path === "/api/schools") {
-    const schoolIds = await getSchools(KV);
-    const schools = [];
-    for (const id of schoolIds) {
-      const school = await getSchool(KV, id);
-      if (school) {
-        const userIds = await getSchoolUsers(KV, id);
-        schools.push({ ...school, userCount: userIds.length });
-      }
-    }
+    const schools = await getSchoolsSnapshot(KV);
     return jsonResp({ schools });
   }
 
@@ -779,6 +872,7 @@ async function handleAPI(request, env, path) {
     if (!schools.includes(id)) {
       schools.push(id);
       await saveSchools(KV, schools);
+      await saveSchoolUsersSnapshot(KV, id, []);
     }
     // 自动在 GitHub 创建仓库并从 hcd 复制代码
     let repoInit = null;
@@ -797,8 +891,8 @@ async function handleAPI(request, env, path) {
   if (method === "GET" && schoolMatch) {
     const school = await getSchool(KV, schoolMatch[1]);
     if (!school) return jsonResp({ error: "School not found" }, 404);
-    const userIds = await getSchoolUsers(KV, schoolMatch[1]);
-    return jsonResp({ school, userCount: userIds.length });
+    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolMatch[1]);
+    return jsonResp({ school, userCount: schoolUsers.length });
   }
 
   // PUT /api/school/:id
@@ -821,15 +915,8 @@ async function handleAPI(request, env, path) {
   const usersMatch = path.match(/^\/api\/school\/([^/]+)\/users$/);
   if (method === "GET" && usersMatch) {
     const schoolId = usersMatch[1];
-    const userIds = await getSchoolUsers(KV, schoolId);
-    const users = [];
-    for (const uid of userIds) {
-      const user = await getUser(KV, schoolId, uid);
-      if (user) {
-        const masked = { ...user, password: user.password ? "******" : "" };
-        users.push(masked);
-      }
-    }
+    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
+    const users = schoolUsers.map(user => ({ ...user, password: user.password ? "******" : "" }));
     return jsonResp({ users });
   }
 
@@ -839,6 +926,7 @@ async function handleAPI(request, env, path) {
     const schoolId = userCreateMatch[1];
     const body = await request.json();
     const id = body.id || generateId();
+    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
     const user = defaultUser(id);
     user.phone = body.phone || "";
     user.username = body.username || "";
@@ -848,7 +936,7 @@ async function handleAPI(request, env, path) {
     if (body.schedule) user.schedule = body.schedule;
 
     if (user.status === "active") {
-      const conflicts = await findSeatConflicts(KV, schoolId, user.schedule || {}, "");
+      const conflicts = await findSeatConflicts(KV, schoolId, user.schedule || {}, "", schoolUsers);
       if (conflicts.length > 0) {
         return jsonResp({
           error: buildSeatConflictError(conflicts),
@@ -863,6 +951,7 @@ async function handleAPI(request, env, path) {
       userIds.push(id);
       await saveSchoolUsers(KV, schoolId, userIds);
     }
+    await setSchoolUserCountInSnapshot(KV, schoolId, userIds.length);
     return jsonResp({ ok: true, user: { ...user, password: "******" } });
   }
 
@@ -880,11 +969,12 @@ async function handleAPI(request, env, path) {
     const user = await getUser(KV, schoolId, userId);
     if (!user) return jsonResp({ error: "User not found" }, 404);
     const body = await request.json();
+    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
 
     const nextStatus = body.status !== undefined ? body.status : user.status;
     const nextSchedule = body.schedule ? body.schedule : (user.schedule || {});
     if (nextStatus === "active") {
-      const conflicts = await findSeatConflicts(KV, schoolId, nextSchedule, userId);
+      const conflicts = await findSeatConflicts(KV, schoolId, nextSchedule, userId, schoolUsers);
       if (conflicts.length > 0) {
         return jsonResp({
           error: buildSeatConflictError(conflicts),
@@ -905,7 +995,10 @@ async function handleAPI(request, env, path) {
 
   // DELETE /api/school/:id/user/:userId
   if (method === "DELETE" && userMatch) {
-    await deleteUser(KV, userMatch[1], userMatch[2]);
+    const schoolId = userMatch[1];
+    const nextUserIds = await getSchoolUsers(KV, schoolId);
+    await deleteUser(KV, schoolId, userMatch[2]);
+    await setSchoolUserCountInSnapshot(KV, schoolId, Math.max(0, nextUserIds.length - 1));
     return jsonResp({ ok: true });
   }
 
@@ -1052,6 +1145,7 @@ async function handleAPI(request, env, path) {
         const school = defaultSchool(demo.id, demo.name);
         school.repo = demo.repo;
         await saveSchool(KV, school);
+        await saveSchoolUsersSnapshot(KV, demo.id, []);
         existingSchools.push(demo.id);
       }
     }
@@ -1895,7 +1989,14 @@ async function doAddSchool() {
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
   if (!id || !name) return toast("请填写必要信息", "error");
-  const res = await api("POST", "/api/school", { id, name, repo, trigger_time, endtime, fidEnc });
+  const res = await api("POST", "/api/school", {
+    id,
+    name,
+    repo,
+    trigger_time,
+    endtime,
+    fidEnc,
+  });
   if (res.ok) {
     let msg = "学校添加成功";
     if (res.repoInit) {
@@ -2157,7 +2258,7 @@ async function deleteUser(userId) {
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(writeHeartbeatAtTargetSecond(env.SEAT_KV));
+    ctx.waitUntil(writeHeartbeatTimestamp(env.SEAT_KV));
     ctx.waitUntil(handleScheduled(env));
   },
   async fetch(request, env, ctx) {

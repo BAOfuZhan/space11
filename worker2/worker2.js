@@ -19,6 +19,16 @@ function beijingHMS() {
   ].join(":");
 }
 
+function beijingDateMinute(offsetMinutes = 0) {
+  const d = new Date(Date.now() + (8 * 3600 + offsetMinutes * 60) * 1000);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hour = String(d.getUTCHours()).padStart(2, "0");
+  const minute = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${y}-${m}-${day}-${hour}:${minute}`;
+}
+
 function jsonResp(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -27,7 +37,12 @@ function jsonResp(data, status = 200) {
 }
 
 const HEARTBEAT_LAST_TS_KEY = "meta:heartbeat:last_ts";
-const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
+const HEARTBEAT_LAST_MINUTE_KEY = "meta:heartbeat:last_minute";
+// tongyi 侧是分钟级心跳，且依赖 Cloudflare cron + 跨账号 KV 读取。
+// 单次 cron 漂移或漏跑并不等于 worker 异常，因此这里至少容忍 2 个心跳周期，避免误触发兜底。
+const HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const HEARTBEAT_TIMEOUT_MS = 2 * HEARTBEAT_INTERVAL_MS + 10 * 1000;
+const HEARTBEAT_CONFIRM_DELAY_MS = 8000;
 const FALLBACK_HOUR_LOCK_PREFIX = "meta:fallback_hour_lock";
 const FALLBACK_HOUR_LOCK_TTL_SECONDS = 48 * 60 * 60;
 
@@ -38,6 +53,11 @@ function beijingDateHour() {
   const day = String(d.getUTCDate()).padStart(2, "0");
   const hour = String(d.getUTCHours()).padStart(2, "0");
   return `${y}-${m}-${day}-${hour}`;
+}
+
+async function sleep(ms) {
+  if (ms <= 0) return;
+  await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getRemoteKvConfig(env) {
@@ -103,6 +123,32 @@ async function getHeartbeatTimestamp(env) {
   const ts = parseInt(String(raw || "").trim(), 10);
   if (Number.isNaN(ts) || ts <= 0) return null;
   return ts;
+}
+
+async function getHeartbeatMinuteSlot(env) {
+  const raw = await getRemoteKvText(env, HEARTBEAT_LAST_MINUTE_KEY);
+  const slot = String(raw || "").trim();
+  return slot || null;
+}
+
+async function getHeartbeatState(env) {
+  const [heartbeatTs, heartbeatMinuteSlot] = await Promise.all([
+    getHeartbeatTimestamp(env),
+    getHeartbeatMinuteSlot(env),
+  ]);
+  return { heartbeatTs, heartbeatMinuteSlot };
+}
+
+function isHeartbeatSlotHealthy(heartbeatMinuteSlot) {
+  if (!heartbeatMinuteSlot) return false;
+  return heartbeatMinuteSlot === beijingDateMinute(0) || heartbeatMinuteSlot === beijingDateMinute(-1);
+}
+
+function getExpectedHeartbeatSlots() {
+  return {
+    current: beijingDateMinute(0),
+    previous: beijingDateMinute(-1),
+  };
 }
 
 function buildFallbackHourLockKey(hourKey) {
@@ -371,8 +417,9 @@ async function runWatchdog(env, options = {}) {
   const nowIso = new Date().toISOString();
   const hourKey = beijingDateHour();
   let heartbeatTs = null;
+  let heartbeatMinuteSlot = null;
   try {
-    heartbeatTs = await getHeartbeatTimestamp(env);
+    ({ heartbeatTs, heartbeatMinuteSlot } = await getHeartbeatState(env));
   } catch (e) {
     const notification = await sendFeishuText(
       env,
@@ -392,29 +439,70 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       fallbackHourKey: hourKey,
       notification,
     };
   }
-  const diffMs = heartbeatTs === null ? null : Math.max(0, Date.now() - heartbeatTs);
-  const diffSeconds = diffMs === null ? null : Math.floor(diffMs / 1000);
-  const isStale = heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
+  let diffMs = heartbeatTs === null ? null : Math.max(0, Date.now() - heartbeatTs);
+  let diffSeconds = diffMs === null ? null : Math.floor(diffMs / 1000);
+  let expectedSlots = getExpectedHeartbeatSlots();
+  let isStale = heartbeatMinuteSlot
+    ? !isHeartbeatSlotHealthy(heartbeatMinuteSlot)
+    : heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
+  let heartbeatRecheck = null;
   const fallbackOptions = {
     triggerSource: "worker2",
     fallbackMode: options.manual ? "manual" : "scheduled",
   };
 
+  if (isStale) {
+    await sleep(HEARTBEAT_CONFIRM_DELAY_MS);
+    try {
+      const {
+        heartbeatTs: recheckedHeartbeatTs,
+        heartbeatMinuteSlot: recheckedHeartbeatMinuteSlot,
+      } = await getHeartbeatState(env);
+      const recheckedDiffMs = recheckedHeartbeatTs === null ? null : Math.max(0, Date.now() - recheckedHeartbeatTs);
+      const recheckedDiffSeconds = recheckedDiffMs === null ? null : Math.floor(recheckedDiffMs / 1000);
+      heartbeatRecheck = {
+        delayMs: HEARTBEAT_CONFIRM_DELAY_MS,
+        heartbeatTs: recheckedHeartbeatTs,
+        heartbeatMinuteSlot: recheckedHeartbeatMinuteSlot,
+        diffMs: recheckedDiffMs,
+        diffSeconds: recheckedDiffSeconds,
+      };
+
+      heartbeatTs = recheckedHeartbeatTs;
+      heartbeatMinuteSlot = recheckedHeartbeatMinuteSlot;
+      diffMs = recheckedDiffMs;
+      diffSeconds = recheckedDiffSeconds;
+      expectedSlots = getExpectedHeartbeatSlots();
+      isStale = heartbeatMinuteSlot
+        ? !isHeartbeatSlotHealthy(heartbeatMinuteSlot)
+        : heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
+    } catch (e) {
+      heartbeatRecheck = {
+        delayMs: HEARTBEAT_CONFIRM_DELAY_MS,
+        error: e.message || String(e),
+      };
+    }
+  }
+
   if (!isStale) {
     return {
       ok: true,
-      mode: "healthy",
+      mode: heartbeatRecheck ? "healthy_after_recheck" : "healthy",
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
     };
   }
@@ -430,10 +518,13 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
     };
   }
@@ -460,10 +551,13 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
       notification,
     };
@@ -478,10 +572,13 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
       fallbackLock: existingLock,
     };
@@ -496,6 +593,7 @@ async function runWatchdog(env, options = {}) {
       at: nowIso,
       beijing_time: beijingHMS(),
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
     });
@@ -518,23 +616,34 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
       notification,
     };
   }
 
   const heartbeatLabel = heartbeatTs === null ? "无记录" : String(heartbeatTs);
+  const heartbeatMinuteLabel = heartbeatMinuteSlot || "无记录";
+  const expectedHeartbeatLabel = `${expectedSlots.previous} ~ ${expectedSlots.current}`;
+  const recheckHeartbeatMinuteLabel = heartbeatRecheck?.heartbeatMinuteSlot || "";
   const preNotification = await sendFeishuText(
     env,
     [
       "worker2 告警：检测到 tongyi 心跳超时，准备执行兜底任务。",
+      `期望心跳分钟槽位: ${expectedHeartbeatLabel}`,
+      `最近心跳分钟槽位: ${heartbeatMinuteLabel}`,
+      recheckHeartbeatMinuteLabel ? `复查心跳分钟槽位: ${recheckHeartbeatMinuteLabel}` : "",
       `最近心跳(ms): ${heartbeatLabel}`,
       diffSeconds === null ? "" : `距离上次心跳: ${diffSeconds} 秒`,
       `超时阈值: ${Math.floor(HEARTBEAT_TIMEOUT_MS / 1000)} 秒`,
+      `复查等待: ${Math.floor(HEARTBEAT_CONFIRM_DELAY_MS / 1000)} 秒`,
+      heartbeatRecheck?.error ? `复查错误: ${heartbeatRecheck.error}` : "",
       `北京时间: ${beijingHMS()}`,
       `小时锁: ${hourKey}`,
     ].filter(Boolean).join("\n")
@@ -557,9 +666,14 @@ async function runWatchdog(env, options = {}) {
     formatFallbackMessages(
       "worker2 告警：tongyi 心跳超时，已执行兜底触发。",
       [
+      `期望心跳分钟槽位: ${expectedHeartbeatLabel}`,
+      `最近心跳分钟槽位: ${heartbeatMinuteLabel}`,
+      recheckHeartbeatMinuteLabel ? `复查心跳分钟槽位: ${recheckHeartbeatMinuteLabel}` : "",
       `最近心跳(ms): ${heartbeatLabel}`,
       diffSeconds === null ? "" : `距离上次心跳: ${diffSeconds} 秒`,
       `超时阈值: ${Math.floor(HEARTBEAT_TIMEOUT_MS / 1000)} 秒`,
+      `复查等待: ${Math.floor(HEARTBEAT_CONFIRM_DELAY_MS / 1000)} 秒`,
+      heartbeatRecheck?.error ? `复查错误: ${heartbeatRecheck.error}` : "",
       `北京时间: ${beijingHMS()}`,
       `小时锁: ${hourKey}`,
       fallbackError ? `兜底执行错误: ${fallbackError}` : "",
@@ -575,10 +689,13 @@ async function runWatchdog(env, options = {}) {
       now: nowIso,
       beijing_time: beijingHMS(),
       heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
       heartbeatTs,
+      heartbeatMinuteSlot,
       diffMs,
       diffSeconds,
       thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      heartbeatRecheck,
       fallbackHourKey: hourKey,
       fallbackLock,
       preNotification,
@@ -602,9 +719,10 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/health") {
       let heartbeatTs = null;
+      let heartbeatMinuteSlot = null;
       let heartbeatError = "";
       try {
-        heartbeatTs = await getHeartbeatTimestamp(env);
+        ({ heartbeatTs, heartbeatMinuteSlot } = await getHeartbeatState(env));
       } catch (e) {
         heartbeatError = e.message || String(e);
       }
@@ -614,7 +732,9 @@ export default {
         now: new Date().toISOString(),
         beijing_time: beijingHMS(),
         heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+        heartbeatMinuteKey: HEARTBEAT_LAST_MINUTE_KEY,
         heartbeatTs,
+        heartbeatMinuteSlot,
         heartbeatError,
       });
     }

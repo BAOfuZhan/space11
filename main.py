@@ -140,7 +140,7 @@ def _pick_ordered_fallback_seat(
     return formatted_seat, formatted_offset
 
 
-ENDTIME = "20:00:40"  # 根据学校的预约座位时间+40ms即可
+ENDTIME = "23:22:40"  # 根据学校的预约座位时间+40ms即可
 WARM_CONNECTION_LEAD_MS = 2500  # 连接预热提前量（毫秒）
 FIRST_TOKEN_DATE_MODE = "today"  # 首次取 token 的日期：today 或 submit_date
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
